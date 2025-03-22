@@ -182,77 +182,88 @@ impl OnlineCelestiaProvider {
         let start_index = blob.index.unwrap() - (first_row_index * ods_size);
         let end_index = start_index + blob.shares_len() as u64;
 
-        let share_proof = self
-            .client
-            .share_get_range(&header, start_index, end_index)
-            .await
-            .with_context(|| "Failed getting share proof")?
-            .proof;
+        println!("DEBUG: Share proof parameters:");
+        println!("DEBUG: start_index: {}, end_index: {}", start_index, end_index);
+        println!("DEBUG: range size: {}", end_index - start_index);
+        println!("DEBUG: blob shares length: {}", blob.shares_len());
+        println!("DEBUG: Header size estimate: {} bytes", std::mem::size_of_val(&header) + header.dah.row_roots().len() * 32);
 
-        // validate the proof before placing it on the KV store
-        share_proof
-            .verify(data_root)
-            .with_context(|| "failed to verify share proof against data root")?;
+        // The Celestia RPC server seems to have a limit on the number of shares 
+        // that can be fetched at once (causing 413 Payload Too Large errors)
+        // Let's try with just a single share to see if we can get anything
+        const MAX_SHARES_PER_REQUEST: u64 = 1; // Try with just 1 share
+        
+        // Try with a smaller range to see if it works
+        let test_end_index = std::cmp::min(start_index + MAX_SHARES_PER_REQUEST, end_index);
+        println!("DEBUG: Trying with minimal range: {} to {}", start_index, test_end_index);
+        
+        match self.client.share_get_range(&header, start_index, test_end_index).await {
+            Ok(share_proof_result) => {
+                // validate the proof before placing it on the KV store
+                share_proof_result.proof.verify(data_root).with_context(|| "failed to verify share proof against data root")?;
 
-        let event = self
-            .find_data_commitment(height, l1_provider)
-            .await
-            .unwrap();
+                let event = self
+                    .find_data_commitment(height, l1_provider)
+                    .await
+                    .unwrap();
 
-        let data_root_proof = self
-            .client
-            .get_data_root_tuple_inclusion_proof(height, event.start_block, event.end_block)
-            .await?;
+                let data_root_proof = self
+                    .client
+                    .get_data_root_tuple_inclusion_proof(height, event.start_block, event.end_block)
+                    .await?;
 
-        let encoded_data_root_tuple = encode_data_root_tuple(height, &data_root);
+                let encoded_data_root_tuple = encode_data_root_tuple(height, &data_root);
 
-        data_root_proof
-            .verify(encoded_data_root_tuple, *event.data_commitment.clone())
-            .with_context(||"failed to verify data root tuple inclusion proof")?;
+                data_root_proof
+                    .verify(encoded_data_root_tuple, *event.data_commitment.clone())
+                    .with_context(||"failed to verify data root tuple inclusion proof")?;
 
-        let slot = calculate_mapping_slot(DATA_COMMITMENTS_SLOT, event.proof_nonce);
+                let slot = calculate_mapping_slot(DATA_COMMITMENTS_SLOT, event.proof_nonce);
 
-        let slot_b256 = B256::from_slice(slot.as_slice());
+                let slot_b256 = B256::from_slice(slot.as_slice());
 
-        let proof_response = l1_provider
-            .get_proof(self.blobstream_address, vec![slot_b256])
-            .await?;
+                let proof_response = l1_provider
+                    .get_proof(self.blobstream_address, vec![slot_b256])
+                    .await?;
 
-        let proof_bytes: Vec<Bytes> = proof_response
-            .storage_proof
-            .into_iter()
-            .flat_map(|proof| {
-                // Extract the proof field and apply any needed transformations
-                proof.proof.into_iter().map(|bytes| {
-                    // You can apply transformations here if needed
-                    // For example: Bytes::from(some_transformation(bytes))
-                    // But in this case, we can just return the bytes directly
-                    bytes
-                })
-            })
-            .collect();
+                let proof_bytes: Vec<Bytes> = proof_response
+                    .storage_proof
+                    .into_iter()
+                    .flat_map(|proof| {
+                        // Extract the proof field and apply any needed transformations
+                        proof.proof.into_iter().map(|bytes| {
+                            // You can apply transformations here if needed
+                            // For example: Bytes::from(some_transformation(bytes))
+                            // But in this case, we can just return the bytes directly
+                            bytes
+                        })
+                    })
+                    .collect();
 
-        match verify_data_commitment_storage(
-            proof_response.storage_hash,
-            proof_bytes.clone(),
-            event.proof_nonce,
-            event.data_commitment,
-        ) {
-            Ok(_) => {
-                println!("Succesfully verified storage proof for Blobstream data commitment");
-
-                return Ok(OraclePayload::new(
-                    Bytes::from(blob.data),
-                    data_root,
-                    event.data_commitment,
-                    data_root_proof,
-                    share_proof,
+                match verify_data_commitment_storage(
+                    proof_response.storage_hash,
+                    proof_bytes.clone(),
                     event.proof_nonce,
-                    proof_response.storage_hash.clone(),
-                    proof_bytes,
-                ));
+                    event.data_commitment,
+                ) {
+                    Ok(_) => {
+                        println!("Succesfully verified storage proof for Blobstream data commitment");
+
+                        return Ok(OraclePayload::new(
+                            Bytes::from(blob.data),
+                            data_root,
+                            event.data_commitment,
+                            data_root_proof,
+                            share_proof_result.proof,
+                            event.proof_nonce,
+                            proof_response.storage_hash.clone(),
+                            proof_bytes,
+                        ));
+                    }
+                    Err(err) => anyhow::bail!("Error verifying storage proof {}", err),
+                }
             }
-            Err(err) => anyhow::bail!("Error verifying storage proof {}", err),
+            Err(err) => anyhow::bail!("Failed getting share proof: {}", err),
         }
     }
 }
